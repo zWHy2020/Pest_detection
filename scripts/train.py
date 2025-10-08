@@ -1,12 +1,16 @@
 # scripts/train.py
 """
-多模态病虫害识别模型训练脚本
+多模态病虫害识别模型训练脚本 - 多GPU版本
+支持DataParallel和DistributedDataParallel两种模式
 """
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 import argparse
 import os
 import sys
@@ -24,40 +28,77 @@ from utils.metrics import calculate_metrics, AverageMeter
 from utils.visualization import plot_confusion_matrix, plot_training_curves
 
 
-class Trainer:
-    """训练器类"""
-    def __init__(self, args):
+def setup_distributed(rank, world_size):
+    """初始化分布式训练环境"""
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    
+    # 初始化进程组
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
+
+
+def cleanup_distributed():
+    """清理分布式训练环境"""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+class MultiGPUTrainer:
+    """多GPU训练器类"""
+    def __init__(self, args, rank=0, world_size=1):
         self.args = args
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.rank = rank  # 当前GPU的rank
+        self.world_size = world_size  # 总GPU数量
+        self.is_main_process = (rank == 0)  # 只有rank 0进行日志记录
         
-        # 创建输出目录
-        self.output_dir = os.path.join(args.output_dir, args.exp_name)
-        os.makedirs(self.output_dir, exist_ok=True)
-        os.makedirs(os.path.join(self.output_dir, 'checkpoints'), exist_ok=True)
+        # 设置设备
+        if args.distributed:
+            torch.cuda.set_device(rank)
+            self.device = torch.device(f'cuda:{rank}')
         
-        # TensorBoard
-        self.writer = SummaryWriter(os.path.join(self.output_dir, 'logs'))
+        else:
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # 保存配置
-        with open(os.path.join(self.output_dir, 'config.json'), 'w') as f:
-            json.dump(vars(args), f, indent=2)
+        if self.is_main_process:
+            print(f"\n{'='*60}")
+            print(f"多GPU训练配置")
+            print(f"{'='*60}")
+            print(f"训练模式: {'DistributedDataParallel' if args.distributed else 'DataParallel'}")
+            print(f"GPU数量: {world_size}")
+            print(f"总batch size: {args.batch_size * world_size}")
+            print(f"每GPU batch size: {args.batch_size}")
+            print(f"{'='*60}\n")
+        
+        # 创建输出目录（只在主进程）
+        if self.is_main_process:
+            self.output_dir = os.path.join(args.output_dir, args.exp_name)
+            os.makedirs(self.output_dir, exist_ok=True)
+            os.makedirs(os.path.join(self.output_dir, 'checkpoints'), exist_ok=True)
+            
+            # TensorBoard
+            self.writer = SummaryWriter(os.path.join(self.output_dir, 'logs'))
+            
+            # 保存配置
+            with open(os.path.join(self.output_dir, 'config.json'), 'w') as f:
+                json.dump(vars(args), f, indent=2)
         
         # 创建数据加载器
-        print("创建数据加载器...")
-        self.train_loader, self.val_loader, self.test_loader = create_dataloaders(
-            data_root=args.data_root,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            text_model_name=args.text_model_name,
-            use_augmentation=args.use_augmentation
-        )
+        if self.is_main_process:
+            print("创建数据加载器...")
         
-        print(f"训练集大小: {len(self.train_loader.dataset)}")
-        print(f"验证集大小: {len(self.val_loader.dataset)}")
-        print(f"测试集大小: {len(self.test_loader.dataset)}")
+        self.train_loader, self.val_loader, self.test_loader = self._create_dataloaders()
+        
+        if self.is_main_process:
+            print(f"训练集: {len(self.train_loader.dataset)} 样本")
+            print(f"验证集: {len(self.val_loader.dataset)} 样本")
+            print(f"测试集: {len(self.test_loader.dataset)} 样本")
+            print(f"类别数: {self.train_loader.dataset.num_classes}")
         
         # 创建模型
-        print("创建模型...")
+        if self.is_main_process:
+            print("\n创建模型...")
+        
         self.model = MultiModalPestDetection(
             num_classes=self.train_loader.dataset.num_classes,
             rgb_image_size=args.rgb_size,
@@ -76,34 +117,36 @@ class Trainer:
             freeze_encoders=args.freeze_encoders
         )
         
-        self.model = self.model.to(self.device)
-        
-        # 打印模型信息
-        total_params = sum(p.numel() for p in self.model.parameters())
-        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        print(f"\n模型参数统计:")
-        print(f"总参数: {total_params / 1e6:.2f}M")
-        print(f"可训练参数: {trainable_params / 1e6:.2f}M")
-        print(f"可训练比例: {100 * trainable_params / total_params:.2f}%\n")
-        
-        # 优化器
-        if args.use_lora:
-            # 只优化LoRA参数
-            from models.adapters.lora import get_lora_parameters
-            lora_params = get_lora_parameters(self.model)
-            other_params = [p for p in self.model.parameters() 
-                          if p.requires_grad and p not in lora_params]
-            
-            self.optimizer = optim.AdamW([
-                {'params': lora_params, 'lr': args.lr * 10},  # LoRA参数使用更高学习率
-                {'params': other_params, 'lr': args.lr}
-            ], weight_decay=args.weight_decay)
-        else:
-            self.optimizer = optim.AdamW(
-                filter(lambda p: p.requires_grad, self.model.parameters()),
-                lr=args.lr,
-                weight_decay=args.weight_decay
+        # 移动模型到GPU并包装
+        if args.distributed:
+            # 使用DistributedDataParallel
+            self.model = self.model.to(self.device)
+            self.model = DDP(
+                self.model, 
+                device_ids=[rank],
+                output_device=rank,
+                find_unused_parameters=True  # 处理可能的未使用参数
             )
+        else:
+            # 使用DataParallel（更简单但效率略低）
+            self.model = self.model.to(self.device)
+            if torch.cuda.device_count() > 1:
+                if self.is_main_process:
+                    print(f"使用 DataParallel，{torch.cuda.device_count()} 个GPU")
+                self.model = nn.DataParallel(self.model)
+        
+        # 打印模型信息（只在主进程）
+        if self.is_main_process:
+            model_for_count = self.model.module if hasattr(self.model, 'module') else self.model
+            total_params = sum(p.numel() for p in model_for_count.parameters())
+            trainable_params = sum(p.numel() for p in model_for_count.parameters() if p.requires_grad)
+            print(f"\n模型参数统计:")
+            print(f"总参数: {total_params / 1e6:.2f}M")
+            print(f"可训练参数: {trainable_params / 1e6:.2f}M")
+            print(f"可训练比例: {100 * trainable_params / total_params:.2f}%\n")
+        
+        # 创建优化器
+        self._create_optimizer()
         
         # 学习率调度器
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -121,7 +164,131 @@ class Trainer:
         # 最佳指标
         self.best_acc = 0.0
         self.best_f1 = 0.0
+        self.global_step = 0
+    
+    def _create_dataloaders(self):
+        """创建数据加载器"""
+        # 根据是否使用分布式采样器
+        if self.args.distributed:
+            # 使用DistributedSampler
+            from data.dataset import PestDataset
+            
+            train_dataset = PestDataset(
+                data_root=self.args.data_root,
+                split='train',
+                text_model_name=self.args.text_model_name,
+                use_augmentation=self.args.use_augmentation
+            )
+            
+            val_dataset = PestDataset(
+                data_root=self.args.data_root,
+                split='val',
+                text_model_name=self.args.text_model_name,
+                use_augmentation=False
+            )
+            
+            test_dataset = PestDataset(
+                data_root=self.args.data_root,
+                split='test',
+                text_model_name=self.args.text_model_name,
+                use_augmentation=False
+            )
+            
+            # 创建分布式采样器
+            train_sampler = DistributedSampler(
+                train_dataset,
+                num_replicas=self.world_size,
+                rank=self.rank,
+                shuffle=True
+            )
+            
+            val_sampler = DistributedSampler(
+                val_dataset,
+                num_replicas=self.world_size,
+                rank=self.rank,
+                shuffle=False
+            )
+            
+            test_sampler = DistributedSampler(
+                test_dataset,
+                num_replicas=self.world_size,
+                rank=self.rank,
+                shuffle=False
+            )
+            
+            from data.dataset import collate_fn
+            from torch.utils.data import DataLoader
+            
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=self.args.batch_size,
+                sampler=train_sampler,
+                num_workers=self.args.num_workers,
+                collate_fn=collate_fn,
+                pin_memory=True
+            )
+            
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=self.args.batch_size,
+                sampler=val_sampler,
+                num_workers=self.args.num_workers,
+                collate_fn=collate_fn,
+                pin_memory=True
+            )
+            
+            test_loader = DataLoader(
+                test_dataset,
+                batch_size=self.args.batch_size,
+                sampler=test_sampler,
+                num_workers=self.args.num_workers,
+                collate_fn=collate_fn,
+                pin_memory=True
+            )
+            
+            return train_loader, val_loader, test_loader
+        else:
+            # 使用普通的create_dataloaders
+            return create_dataloaders(
+                data_root=self.args.data_root,
+                batch_size=self.args.batch_size,
+                num_workers=self.args.num_workers,
+                text_model_name=self.args.text_model_name,
+                use_augmentation=self.args.use_augmentation
+            )
+    
+    def _create_optimizer(self):
+        """创建优化器"""
+        # 获取实际的模型（去除DDP/DP包装）
+        model_for_opt = self.model.module if hasattr(self.model, 'module') else self.model
         
+        if self.args.use_lora:
+            from models.adapters.lora import get_lora_parameters
+            #lora_params = get_lora_parameters(model_for_opt)
+            lora_params = list(get_lora_parameters(model_for_opt))
+            lora_param_ids = {id(p) for p in lora_params}
+            other_params = [p for p in model_for_opt.parameters()
+                            if p.requires_grad and id(p) not in lora_param_ids]
+            
+            #other_params = [p for p in model_for_opt.parameters() 
+                          #if p.requires_grad and p not in lora_params]
+            param_groups = []
+            if lora_params:
+                param_groups.append({'params': lora_params, 'lr': self.args.lr * 10})
+            if other_params:
+                param_groups.append({'params': other_params, 'lr': self.args.lr})
+            self.optimizer = optim.AdamW(param_groups, weight_decay=self.args.weight_decay)
+            #self.optimizer = optim.AdamW([
+                #{'params': lora_params, 'lr': self.args.lr * 10},
+                #{'params': other_params, 'lr': self.args.lr}
+            #], weight_decay=self.args.weight_decay)
+        else:
+            self.optimizer = optim.AdamW(
+                filter(lambda p: p.requires_grad, model_for_opt.parameters()),
+                lr=self.args.lr,
+                weight_decay=self.args.weight_decay
+            )
+    
     def train_epoch(self, epoch):
         """训练一个epoch"""
         self.model.train()
@@ -130,7 +297,15 @@ class Trainer:
         cls_losses = AverageMeter()
         align_losses = AverageMeter()
         
-        pbar = tqdm(self.train_loader, desc=f'Epoch {epoch}/{self.args.epochs} [Train]')
+        # 设置分布式采样器的epoch
+        if self.args.distributed:
+            self.train_loader.sampler.set_epoch(epoch)
+        
+        # 只在主进程显示进度条
+        if self.is_main_process:
+            pbar = tqdm(self.train_loader, desc=f'Epoch {epoch}/{self.args.epochs} [Train]')
+        else:
+            pbar = self.train_loader
         
         for batch_idx, batch in enumerate(pbar):
             # 移动数据到设备
@@ -149,6 +324,8 @@ class Trainer:
                         labels=labels
                     )
                     loss = outputs['total_loss']
+                    if isinstance(loss, torch.Tensor) and loss.dim() > 0:
+                        loss = loss.mean()
                 
                 self.optimizer.zero_grad()
                 self.scaler.scale(loss).backward()
@@ -168,6 +345,8 @@ class Trainer:
                     labels=labels
                 )
                 loss = outputs['total_loss']
+                if isinstance(loss, torch.Tensor) and loss.dim() > 0:
+                    loss = loss.mean()
                 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -181,22 +360,24 @@ class Trainer:
             
             # 更新统计
             losses.update(loss.item(), rgb_images.size(0))
-            cls_losses.update(outputs['cls_loss'].item(), rgb_images.size(0))
-            align_losses.update(outputs['alignment_loss'].item(), rgb_images.size(0))
+            cls_losses.update(outputs['cls_loss'].mean().item() if outputs['cls_loss'].dim() > 0 else outputs['cls_loss'].item(), rgb_images.size(0))
+            align_losses.update(outputs['alignment_loss'].mean().item() if outputs['alignment_loss'].dim() > 0 else outputs['alignment_loss'].item(), rgb_images.size(0))
             
-            # 更新进度条
-            pbar.set_postfix({
-                'loss': f'{losses.avg:.4f}',
-                'cls': f'{cls_losses.avg:.4f}',
-                'align': f'{align_losses.avg:.4f}'
-            })
-            
-            # 记录到TensorBoard
-            global_step = epoch * len(self.train_loader) + batch_idx
-            if batch_idx % self.args.log_interval == 0:
-                self.writer.add_scalar('Train/Loss', losses.avg, global_step)
-                self.writer.add_scalar('Train/ClsLoss', cls_losses.avg, global_step)
-                self.writer.add_scalar('Train/AlignLoss', align_losses.avg, global_step)
+            # 更新进度条（只在主进程）
+            if self.is_main_process:
+                pbar.set_postfix({
+                    'loss': f'{losses.avg:.4f}',
+                    'cls': f'{cls_losses.avg:.4f}',
+                    'align': f'{align_losses.avg:.4f}'
+                })
+                
+                # 记录到TensorBoard
+                if batch_idx % self.args.log_interval == 0:
+                    self.writer.add_scalar('Train/Loss', losses.avg, self.global_step)
+                    self.writer.add_scalar('Train/ClsLoss', cls_losses.avg, self.global_step)
+                    self.writer.add_scalar('Train/AlignLoss', align_losses.avg, self.global_step)
+                
+                self.global_step += 1
         
         return losses.avg
     
@@ -209,7 +390,11 @@ class Trainer:
         all_preds = []
         all_labels = []
         
-        pbar = tqdm(self.val_loader, desc=f'Epoch {epoch}/{self.args.epochs} [Val]')
+        # 只在主进程显示进度条
+        if self.is_main_process:
+            pbar = tqdm(self.val_loader, desc=f'Epoch {epoch}/{self.args.epochs} [Val]')
+        else:
+            pbar = self.val_loader
         
         for batch in pbar:
             rgb_images = batch['rgb_images'].to(self.device)
@@ -225,6 +410,9 @@ class Trainer:
             )
             
             loss = outputs['total_loss']
+            
+            if isinstance(loss, torch.Tensor) and loss.dim() > 0:
+                loss = loss.mean()
             logits = outputs['logits']
             
             losses.update(loss.item(), rgb_images.size(0))
@@ -233,36 +421,64 @@ class Trainer:
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
             
-            pbar.set_postfix({'loss': f'{losses.avg:.4f}'})
+            if self.is_main_process:
+                pbar.set_postfix({'loss': f'{losses.avg:.4f}'})
         
-        # 计算指标
-        metrics = calculate_metrics(
-            np.array(all_labels),
-            np.array(all_preds),
-            num_classes=self.model.num_classes
-        )
+        # 在分布式训练中，需要收集所有进程的预测结果
+        if self.args.distributed:
+            # 将列表转换为tensor
+            preds_tensor = torch.tensor(all_preds, device=self.device)
+            labels_tensor = torch.tensor(all_labels, device=self.device)
+            
+            # 收集所有GPU的结果
+            all_preds_list = [torch.zeros_like(preds_tensor) for _ in range(self.world_size)]
+            all_labels_list = [torch.zeros_like(labels_tensor) for _ in range(self.world_size)]
+            
+            dist.all_gather(all_preds_list, preds_tensor)
+            dist.all_gather(all_labels_list, labels_tensor)
+            
+            # 只在主进程计算指标
+            if self.is_main_process:
+                all_preds = torch.cat(all_preds_list).cpu().numpy()
+                all_labels = torch.cat(all_labels_list).cpu().numpy()
         
-        # 记录到TensorBoard
-        self.writer.add_scalar('Val/Loss', losses.avg, epoch)
-        self.writer.add_scalar('Val/Accuracy', metrics['accuracy'], epoch)
-        self.writer.add_scalar('Val/Precision', metrics['precision'], epoch)
-        self.writer.add_scalar('Val/Recall', metrics['recall'], epoch)
-        self.writer.add_scalar('Val/F1', metrics['f1'], epoch)
-        
-        print(f"\n验证结果:")
-        print(f"Loss: {losses.avg:.4f}")
-        print(f"Accuracy: {metrics['accuracy']:.4f}")
-        print(f"Precision: {metrics['precision']:.4f}")
-        print(f"Recall: {metrics['recall']:.4f}")
-        print(f"F1: {metrics['f1']:.4f}\n")
-        
-        return metrics, all_preds, all_labels
+        # 计算指标（只在主进程）
+        if self.is_main_process:
+            metrics = calculate_metrics(
+                np.array(all_labels),
+                np.array(all_preds),
+                num_classes=self.train_loader.dataset.num_classes
+            )
+            
+            # 记录到TensorBoard
+            self.writer.add_scalar('Val/Loss', losses.avg, epoch)
+            self.writer.add_scalar('Val/Accuracy', metrics['accuracy'], epoch)
+            self.writer.add_scalar('Val/Precision', metrics['precision'], epoch)
+            self.writer.add_scalar('Val/Recall', metrics['recall'], epoch)
+            self.writer.add_scalar('Val/F1', metrics['f1'], epoch)
+            
+            print(f"\n验证结果:")
+            print(f"Loss: {losses.avg:.4f}")
+            print(f"Accuracy: {metrics['accuracy']:.4f}")
+            print(f"Precision: {metrics['precision']:.4f}")
+            print(f"Recall: {metrics['recall']:.4f}")
+            print(f"F1: {metrics['f1']:.4f}\n")
+            
+            return metrics, all_preds, all_labels
+        else:
+            return None, None, None
     
     def save_checkpoint(self, epoch, metrics, is_best=False):
-        """保存检查点"""
+        """保存检查点（只在主进程）"""
+        if not self.is_main_process:
+            return
+        
+        # 获取实际的模型state_dict
+        model_for_save = self.model.module if hasattr(self.model, 'module') else self.model
+        
         checkpoint = {
             'epoch': epoch,
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': model_for_save.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'metrics': metrics,
@@ -281,14 +497,19 @@ class Trainer:
                 self.output_dir, 'checkpoints', 'best_model.pth'
             )
             torch.save(checkpoint, best_path)
-            print(f"保存最佳模型到 {best_path}")
+            print(f"✓ 保存最佳模型 (Acc: {metrics['accuracy']:.4f})")
     
     def train(self):
         """完整训练流程"""
-        print(f"\n开始训练...")
-        print(f"设备: {self.device}")
-        print(f"实验名称: {self.args.exp_name}")
-        print(f"输出目录: {self.output_dir}\n")
+        if self.is_main_process:
+            print(f"\n{'='*60}")
+            print(f"开始训练")
+            print(f"{'='*60}")
+            print(f"输出目录: {self.output_dir}")
+            print(f"总epochs: {self.args.epochs}")
+            print(f"设备: {self.device}")
+            print(f"混合精度: {self.args.use_amp}")
+            print(f"{'='*60}\n")
         
         for epoch in range(1, self.args.epochs + 1):
             # 训练
@@ -299,118 +520,110 @@ class Trainer:
             
             # 更新学习率
             self.scheduler.step()
-            current_lr = self.optimizer.param_groups[0]['lr']
-            self.writer.add_scalar('Train/LR', current_lr, epoch)
             
-            # 保存检查点
-            is_best = metrics['accuracy'] > self.best_acc
-            if is_best:
-                self.best_acc = metrics['accuracy']
-                self.best_f1 = metrics['f1']
-            
-            if epoch % self.args.save_interval == 0 or is_best:
-                self.save_checkpoint(epoch, metrics, is_best)
-            
-            # 保存混淆矩阵
-            if epoch % self.args.plot_interval == 0:
-                cm_path = os.path.join(
-                    self.output_dir, f'confusion_matrix_epoch_{epoch}.png'
-                )
-                plot_confusion_matrix(
-                    labels, preds,
-                    class_names=list(self.train_loader.dataset.class_to_idx.keys()),
-                    save_path=cm_path
-                )
+            # 只在主进程保存检查点
+            if self.is_main_process and metrics is not None:
+                current_lr = self.optimizer.param_groups[0]['lr']
+                self.writer.add_scalar('Train/LR', current_lr, epoch)
+                
+                # 保存检查点
+                is_best = metrics['accuracy'] > self.best_acc
+                if is_best:
+                    self.best_acc = metrics['accuracy']
+                    self.best_f1 = metrics['f1']
+                
+                if epoch % self.args.save_interval == 0 or is_best:
+                    self.save_checkpoint(epoch, metrics, is_best)
+                
+                # 保存混淆矩阵
+                if epoch % self.args.plot_interval == 0:
+                    cm_path = os.path.join(
+                        self.output_dir, f'confusion_matrix_epoch_{epoch}.png'
+                    )
+                    plot_confusion_matrix(
+                        labels, preds,
+                        class_names=list(self.train_loader.dataset.class_to_idx.keys()),
+                        save_path=cm_path
+                    )
         
-        print(f"\n训练完成！")
-        print(f"最佳准确率: {self.best_acc:.4f}")
-        print(f"最佳F1分数: {self.best_f1:.4f}")
-        
-        self.writer.close()
+        if self.is_main_process:
+            print(f"\n{'='*60}")
+            print(f"训练完成！")
+            print(f"{'='*60}")
+            print(f"最佳准确率: {self.best_acc:.4f}")
+            print(f"最佳F1分数: {self.best_f1:.4f}")
+            print(f"{'='*60}\n")
+            
+            self.writer.close()
+
+
+def main_worker(rank, world_size, args):
+    """每个GPU的工作进程"""
+    if args.distributed:
+        setup_distributed(rank, world_size)
+    
+    try:
+        trainer = MultiGPUTrainer(args, rank, world_size)
+        trainer.train()
+    finally:
+        if args.distributed:
+            cleanup_distributed()
 
 
 def parse_args():
     """解析命令行参数"""
-    parser = argparse.ArgumentParser(description='多模态病虫害识别训练')
+    parser = argparse.ArgumentParser(description='多模态病虫害识别训练 - 多GPU版本')
     
     # 数据参数
-    parser.add_argument('--data_root', type=str, required=True,
-                        help='数据集根目录')
+    parser.add_argument('--data_root', type=str, required=True)
     parser.add_argument('--batch_size', type=int, default=16,
-                        help='批次大小')
-    parser.add_argument('--num_workers', type=int, default=4,
-                        help='数据加载工作进程数')
-    parser.add_argument('--use_augmentation', action='store_true',
-                        help='是否使用数据增强')
+                        help='每个GPU的batch size')
+    parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--use_augmentation', action='store_true')
     
     # 模型参数
-    parser.add_argument('--rgb_size', type=int, default=224,
-                        help='RGB图像大小')
-    parser.add_argument('--hsi_size', type=int, default=64,
-                        help='HSI图像大小')
-    parser.add_argument('--hsi_channels', type=int, default=224,
-                        help='HSI波段数')
-    parser.add_argument('--embed_dim', type=int, default=768,
-                        help='嵌入维度')
-    parser.add_argument('--num_heads', type=int, default=12,
-                        help='注意力头数')
-    parser.add_argument('--dropout', type=float, default=0.1,
-                        help='Dropout率')
-    parser.add_argument('--fusion_layers', type=int, default=4,
-                        help='融合层数')
-    parser.add_argument('--fusion_strategy', type=str, default='hierarchical',
-                        choices=['concat', 'gated', 'hierarchical'],
-                        help='融合策略')
-    
-    # 文本编码器参数
-    parser.add_argument('--text_model_name', type=str, default='bert-base-chinese',
-                        help='文本编码器模型名称')
+    parser.add_argument('--rgb_size', type=int, default=224)
+    parser.add_argument('--hsi_size', type=int, default=64)
+    parser.add_argument('--hsi_channels', type=int, default=224)
+    parser.add_argument('--embed_dim', type=int, default=768)
+    parser.add_argument('--num_heads', type=int, default=12)
+    parser.add_argument('--dropout', type=float, default=0.1)
+    parser.add_argument('--fusion_layers', type=int, default=4)
+    parser.add_argument('--fusion_strategy', type=str, default='hierarchical')
+    parser.add_argument('--text_model_name', type=str, default='bert-base-chinese')
     
     # LLM参数
-    parser.add_argument('--use_llm', action='store_true',
-                        help='是否使用大语言模型')
-    parser.add_argument('--llm_model_name', type=str, default=None,
-                        help='大语言模型名称')
-    parser.add_argument('--use_lora', action='store_true',
-                        help='是否使用LoRA')
-    parser.add_argument('--lora_rank', type=int, default=8,
-                        help='LoRA秩')
-    parser.add_argument('--lora_alpha', type=float, default=16,
-                        help='LoRA alpha')
-    parser.add_argument('--freeze_encoders', action='store_true',
-                        help='是否冻结编码器')
+    parser.add_argument('--use_llm', action='store_true')
+    parser.add_argument('--llm_model_name', type=str, default=None)
+    parser.add_argument('--use_lora', action='store_true')
+    parser.add_argument('--lora_rank', type=int, default=8)
+    parser.add_argument('--lora_alpha', type=float, default=16)
+    parser.add_argument('--freeze_encoders', action='store_true')
     
     # 训练参数
-    parser.add_argument('--epochs', type=int, default=100,
-                        help='训练轮数')
-    parser.add_argument('--lr', type=float, default=1e-4,
-                        help='学习率')
-    parser.add_argument('--weight_decay', type=float, default=0.01,
-                        help='权重衰减')
-    parser.add_argument('--label_smoothing', type=float, default=0.1,
-                        help='标签平滑')
-    parser.add_argument('--clip_grad', type=float, default=1.0,
-                        help='梯度裁剪')
-    parser.add_argument('--use_amp', action='store_true',
-                        help='是否使用混合精度训练')
+    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--weight_decay', type=float, default=0.01)
+    parser.add_argument('--label_smoothing', type=float, default=0.1)
+    parser.add_argument('--clip_grad', type=float, default=1.0)
+    parser.add_argument('--use_amp', action='store_true')
+    parser.add_argument('--optimizer', type=str, default='adamw')
+    
+    # 多GPU参数
+    parser.add_argument('--distributed', action='store_true',
+                        help='使用DistributedDataParallel (推荐)')
+    parser.add_argument('--world_size', type=int, default=2,
+                        help='GPU数量')
     
     # 输出参数
-    parser.add_argument('--output_dir', type=str, default='./outputs',
-                        help='输出目录')
-    parser.add_argument('--exp_name', type=str, default='exp',
-                        help='实验名称')
-    parser.add_argument('--save_interval', type=int, default=10,
-                        help='保存间隔(epoch)')
-    parser.add_argument('--log_interval', type=int, default=50,
-                        help='日志间隔(iter)')
-    parser.add_argument('--plot_interval', type=int, default=10,
-                        help='绘图间隔(epoch)')
+    parser.add_argument('--output_dir', type=str, default='./outputs')
+    parser.add_argument('--exp_name', type=str, default='multi_gpu_training')
+    parser.add_argument('--save_interval', type=int, default=10)
+    parser.add_argument('--log_interval', type=int, default=50)
+    parser.add_argument('--plot_interval', type=int, default=10)
     
     # 其他
-    parser.add_argument('--seed', type=int, default=42,
-                        help='随机种子')
-    parser.add_argument('--resume', type=str, default=None,
-                        help='恢复训练的检查点路径')
+    parser.add_argument('--seed', type=int, default=42)
     
     args = parser.parse_args()
     return args
@@ -426,18 +639,43 @@ def set_seed(seed):
 
 
 def main():
-    # 解析参数
     args = parse_args()
-    
-    # 设置随机种子
     set_seed(args.seed)
     
-    # 创建训练器
-    trainer = Trainer(args)
+    # 检测可用的GPU数量
+    if torch.cuda.is_available():
+        available_gpus = torch.cuda.device_count()
+        print(f"\n检测到 {available_gpus} 个GPU:")
+        for i in range(available_gpus):
+            print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
+        
+        if args.world_size > available_gpus:
+            print(f"警告: 指定了{args.world_size}个GPU，但只有{available_gpus}个可用")
+            args.world_size = available_gpus
+    else:
+        print("错误: 没有检测到CUDA设备")
+        return
     
-    # 开始训练
-    trainer.train()
+    if args.distributed and args.world_size > 1:
+        # 使用DistributedDataParallel
+        print(f"\n使用 DistributedDataParallel 训练 ({args.world_size} GPUs)")
+        torch.multiprocessing.spawn(
+            main_worker,
+            args=(args.world_size, args),
+            nprocs=args.world_size,
+            join=True
+        )
+    else:
+        # 使用DataParallel或单GPU
+        if args.world_size > 1:
+            print(f"\n使用 DataParallel 训练 ({args.world_size} GPUs)")
+        else:
+            print("\n使用单GPU训练")
+        
+        args.distributed = False
+        main_worker(0, args.world_size, args)
 
 
 if __name__ == '__main__':
     main()
+

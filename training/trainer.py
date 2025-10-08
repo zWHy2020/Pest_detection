@@ -1,6 +1,6 @@
 # training/trainer.py
 """
-训练器类
+训练器类 - 完整版
 封装完整的训练、验证和测试流程
 """
 
@@ -9,16 +9,17 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 from torch.cuda.amp import autocast, GradScaler
-from typing import Dict, Optional, List
+from typing import Dict, Optional
 from tqdm import tqdm
 import os
 import json
-from datetime import datetime
 import numpy as np
+
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.metrics import AverageMeter, calculate_metrics, MetricsTracker
 from utils.visualization import plot_training_curves
-
 
 class Trainer:
     """
@@ -30,7 +31,6 @@ class Trainer:
         model: nn.Module,
         train_loader,
         val_loader,
-        criterion,
         optimizer,
         scheduler,
         device: str = 'cuda',
@@ -43,28 +43,9 @@ class Trainer:
         save_interval: int = 10,
         early_stopping_patience: int = 20
     ):
-        """
-        Args:
-            model: 模型
-            train_loader: 训练数据加载器
-            val_loader: 验证数据加载器
-            criterion: 损失函数
-            optimizer: 优化器
-            scheduler: 学习率调度器
-            device: 设备
-            output_dir: 输出目录
-            exp_name: 实验名称
-            use_amp: 是否使用混合精度
-            gradient_accumulation_steps: 梯度累积步数
-            gradient_clip: 梯度裁剪阈值
-            log_interval: 日志记录间隔
-            save_interval: 模型保存间隔
-            early_stopping_patience: 早停耐心值
-        """
         self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
-        self.criterion = criterion
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.device = device
@@ -102,6 +83,8 @@ class Trainer:
         self.model.train()
         
         losses = AverageMeter()
+        cls_losses = AverageMeter()
+        align_losses = AverageMeter()
         
         pbar = tqdm(self.train_loader, desc=f'Epoch {epoch} [Train]')
         
@@ -115,7 +98,7 @@ class Trainer:
             text_attention_mask = batch['text_attention_mask'].to(self.device)
             labels = batch['labels'].to(self.device)
             
-            # 前向传播（混合精度）
+            # 前向传播
             if self.use_amp:
                 with autocast():
                     outputs = self.model(
@@ -126,7 +109,6 @@ class Trainer:
                     loss = outputs['total_loss']
                     loss = loss / self.gradient_accumulation_steps
                 
-                # 反向传播
                 self.scaler.scale(loss).backward()
             else:
                 outputs = self.model(
@@ -141,24 +123,18 @@ class Trainer:
             # 梯度累积
             if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
                 if self.use_amp:
-                    # 梯度裁剪
                     if self.gradient_clip > 0:
                         self.scaler.unscale_(self.optimizer)
                         torch.nn.utils.clip_grad_norm_(
                             self.model.parameters(), self.gradient_clip
                         )
-                    
-                    # 更新参数
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
-                    # 梯度裁剪
                     if self.gradient_clip > 0:
                         torch.nn.utils.clip_grad_norm_(
                             self.model.parameters(), self.gradient_clip
                         )
-                    
-                    # 更新参数
                     self.optimizer.step()
                 
                 self.optimizer.zero_grad()
@@ -166,18 +142,30 @@ class Trainer:
             
             # 更新统计
             losses.update(loss.item() * self.gradient_accumulation_steps, rgb_images.size(0))
+            cls_losses.update(outputs['cls_loss'].item(), rgb_images.size(0))
+            align_losses.update(outputs['alignment_loss'].item(), rgb_images.size(0))
             
             # 更新进度条
-            pbar.set_postfix({'loss': f'{losses.avg:.4f}'})
+            pbar.set_postfix({
+                'loss': f'{losses.avg:.4f}',
+                'cls': f'{cls_losses.avg:.4f}',
+                'align': f'{align_losses.avg:.4f}'
+            })
             
             # 记录到TensorBoard
             if batch_idx % self.log_interval == 0:
                 self.writer.add_scalar('Train/Loss', losses.avg, self.global_step)
+                self.writer.add_scalar('Train/ClsLoss', cls_losses.avg, self.global_step)
+                self.writer.add_scalar('Train/AlignLoss', align_losses.avg, self.global_step)
                 self.writer.add_scalar('Train/LR', 
                                       self.optimizer.param_groups[0]['lr'], 
                                       self.global_step)
         
-        return {'train_loss': losses.avg}
+        return {
+            'train_loss': losses.avg,
+            'train_cls_loss': cls_losses.avg,
+            'train_align_loss': align_losses.avg
+        }
     
     @torch.no_grad()
     def validate(self, epoch: int) -> Dict[str, float]:
@@ -187,6 +175,7 @@ class Trainer:
         losses = AverageMeter()
         all_preds = []
         all_labels = []
+        all_probs = []
         
         pbar = tqdm(self.val_loader, desc=f'Epoch {epoch} [Val]')
         
@@ -197,7 +186,6 @@ class Trainer:
             text_attention_mask = batch['text_attention_mask'].to(self.device)
             labels = batch['labels'].to(self.device)
             
-            # 前向传播
             outputs = self.model(
                 rgb_images, hsi_images,
                 text_input_ids, text_attention_mask,
@@ -209,16 +197,21 @@ class Trainer:
             
             losses.update(loss.item(), rgb_images.size(0))
             
+            probs = torch.softmax(logits, dim=1)
             preds = torch.argmax(logits, dim=1)
+            
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
             
             pbar.set_postfix({'loss': f'{losses.avg:.4f}'})
         
         # 计算指标
         metrics = calculate_metrics(
             np.array(all_labels),
-            np.array(all_preds)
+            np.array(all_preds),
+            np.array(all_probs),
+            num_classes=self.model.num_classes
         )
         
         # 记录到TensorBoard
@@ -240,7 +233,7 @@ class Trainer:
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
             'metrics': metrics,
             'best_val_acc': self.best_val_acc,
             'best_val_loss': self.best_val_loss
@@ -272,7 +265,8 @@ class Trainer:
             checkpoint = torch.load(resume_from)
             self.model.load_state_dict(checkpoint['model_state_dict'])
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            if self.scheduler and checkpoint['scheduler_state_dict']:
+                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             start_epoch = checkpoint['epoch'] + 1
             self.best_val_acc = checkpoint['best_val_acc']
             self.best_val_loss = checkpoint['best_val_loss']

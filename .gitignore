@@ -1,0 +1,16 @@
+/data/processed_data
+/data/raw_data
+/evaluation_results
+/models/bert-base-chinese
+/models/qwen2.5-7b
+/outputs
+/test_outputs
+/plantdisease.zip
+/.vscode
+/debug_results
+/scripts/train.py.backup2
+/data_speed_check.py
+/fix_loss.py
+/check_and_fix.py
+/training_config.json
+/setup.py

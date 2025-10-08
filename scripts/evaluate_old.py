@@ -84,7 +84,6 @@ class MultiGPUEvaluator:
             self.gpu_ids = []
             self.device = torch.device('cpu')
             print("未检测到GPU，使用CPU进行评估")
-            print("警告: CPU模式下评估速度会较慢")
     
     def load_checkpoint(self):
         """加载模型检查点"""
@@ -172,25 +171,17 @@ class MultiGPUEvaluator:
         """创建数据加载器"""
         print(f"\n创建数据加载器...")
         
-        # 根据设备类型调整batch size
-        if self.device.type == 'cpu':
-            # CPU模式下使用较小的batch size
-            effective_batch_size = min(self.args.batch_size, 16)
-            print(f"  CPU模式，调整batch size为: {effective_batch_size}")
-        elif self.num_gpus > 1:
-            # 多GPU模式
+        # 根据GPU数量调整batch size
+        effective_batch_size = self.args.batch_size
+        if self.num_gpus > 1:
             effective_batch_size = self.args.batch_size * self.num_gpus
             print(f"  使用{self.num_gpus}个GPU，有效batch size: {effective_batch_size}")
-        else:
-            # 单GPU模式
-            effective_batch_size = self.args.batch_size
-            print(f"  单GPU模式，batch size: {effective_batch_size}")
         
         # 创建数据加载器
         _, _, self.test_loader = create_dataloaders(
             data_root=self.args.data_root,
             batch_size=effective_batch_size,
-            num_workers=self.args.num_workers if self.device.type == 'cuda' else 0,  # CPU模式不使用多进程
+            num_workers=self.args.num_workers,
             text_model_name=self.model_args.get('text_model_name', 'bert-base-chinese'),
             use_augmentation=False
         )
@@ -226,17 +217,10 @@ class MultiGPUEvaluator:
         # 加载模型权重（过滤LLM相关权重）
         self.load_model_weights()
         
-        # 配置多GPU - 只在有GPU且GPU数量>1时使用DataParallel
-        if self.num_gpus > 1 and self.device.type == 'cuda':
+        # 配置多GPU
+        if self.num_gpus > 1:
             print(f"\n配置DataParallel (使用GPU: {self.gpu_ids})")
             self.model = DataParallel(self.model, device_ids=self.gpu_ids)
-            self.use_data_parallel = True
-        else:
-            self.use_data_parallel = False
-            if self.device.type == 'cpu':
-                print("  使用CPU模式（不使用DataParallel）")
-            else:
-                print(f"  使用单GPU模式（GPU {self.device}）")
         
         # 移动模型到设备
         self.model = self.model.to(self.device)
@@ -339,21 +323,12 @@ class MultiGPUEvaluator:
                 text_attention_mask = batch['text_attention_mask'].to(self.device, non_blocking=True)
                 labels = batch['labels'].to(self.device, non_blocking=True)
                 
-                # 前向传播 - 根据是否使用DataParallel调整调用方式
-                if self.use_data_parallel and isinstance(self.model, DataParallel):
-                    # DataParallel模式
-                    outputs = self.model(
-                        rgb_images, hsi_images,
-                        text_input_ids, text_attention_mask,
-                        return_features=extract_features
-                    )
-                else:
-                    # 单GPU或CPU模式
-                    outputs = self.model(
-                        rgb_images, hsi_images,
-                        text_input_ids, text_attention_mask,
-                        return_features=extract_features
-                    )
+                # 前向传播
+                outputs = self.model(
+                    rgb_images, hsi_images,
+                    text_input_ids, text_attention_mask,
+                    return_features=extract_features
+                )
                 
                 # 获取预测结果
                 logits = outputs['logits']
@@ -376,18 +351,16 @@ class MultiGPUEvaluator:
                     'acc': f'{(np.array(all_preds) == np.array(all_labels)).mean():.3f}'
                 })
                 
-                # 定期清理GPU缓存（仅在使用GPU时）
-                if self.device.type == 'cuda' and batch_idx % 10 == 0:
+                # 定期清理GPU缓存
+                if batch_idx % 10 == 0:
                     torch.cuda.empty_cache()
                 
             except RuntimeError as e:
                 if 'out of memory' in str(e):
-                    print(f"\n内存不足，跳过批次 {batch_idx}")
-                    if self.device.type == 'cuda':
-                        torch.cuda.empty_cache()
+                    print(f"\nGPU内存不足，跳过批次 {batch_idx}")
+                    torch.cuda.empty_cache()
                     continue
                 else:
-                    print(f"\n批次 {batch_idx} 发生错误: {e}")
                     raise e
         
         # 转换为numpy数组
@@ -716,3 +689,9 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+
+
+
+

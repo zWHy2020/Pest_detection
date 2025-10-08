@@ -1,6 +1,6 @@
 # models/fusion/cross_modal_alignment.py
 """
-跨模态对齐模块
+跨模态对齐模块 - 修复版
 实现RGB、高光谱图像和文本之间的特征对齐
 """
 
@@ -47,7 +47,7 @@ class CrossModalAttention(nn.Module):
             query: [B, N_q, dim_q]
             key: [B, N_kv, dim_kv]
             value: [B, N_kv, dim_kv]
-            mask: 注意力掩码
+            mask: 注意力掩码 [B, N_kv] 或 [B, 1, 1, N_kv]
         Returns:
             output: [B, N_q, embed_dim]
             attention: [B, num_heads, N_q, N_kv]
@@ -66,9 +66,20 @@ class CrossModalAttention(nn.Module):
         v = v.permute(0, 2, 1, 3)
         
         # 计算注意力分数
-        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = (q @ k.transpose(-2, -1)) * self.scale  # [B, num_heads, N_q, N_kv]
         
+        # 处理mask
         if mask is not None:
+            # 确保mask的维度正确
+            if mask.dim() == 2:  # [B, N_kv]
+                # 扩展为 [B, 1, 1, N_kv]
+                mask = mask.unsqueeze(1).unsqueeze(2)
+            elif mask.dim() == 3:  # [B, 1, N_kv]
+                # 扩展为 [B, 1, 1, N_kv]
+                mask = mask.unsqueeze(2)
+            
+            # 应用mask (将padding位置设为-inf)
+            # mask中1表示有效位置，0表示padding
             attn = attn.masked_fill(mask == 0, float('-inf'))
         
         attn = attn.softmax(dim=-1)
@@ -202,7 +213,7 @@ class CrossModalAlignmentModule(nn.Module):
             rgb_features: [B, N_rgb, D_rgb]
             hsi_features: [B, N_hsi, D_hsi]
             text_features: [B, N_text, D_text]
-            text_mask: 文本掩码
+            text_mask: [B, N_text] 文本掩码，1表示有效token，0表示padding
             
         Returns:
             对齐后的特征和损失
@@ -218,7 +229,7 @@ class CrossModalAlignmentModule(nn.Module):
             rgb_features, text_features, text_features, text_mask
         )
         text_from_rgb, _ = self.rgb_to_text_attn(
-            text_features, rgb_features, rgb_features
+            text_features, rgb_features, rgb_features, None  # RGB不需要mask
         )
         
         # HSI <-> Text
@@ -226,12 +237,12 @@ class CrossModalAlignmentModule(nn.Module):
             hsi_features, text_features, text_features, text_mask
         )
         text_from_hsi, _ = self.hsi_to_text_attn(
-            text_features, hsi_features, hsi_features
+            text_features, hsi_features, hsi_features, None  # HSI不需要mask
         )
         
         # RGB <-> HSI
         rgb_from_hsi, _ = self.rgb_to_hsi_attn(
-            rgb_features, hsi_features, hsi_features
+            rgb_features, hsi_features, hsi_features, None  # 都不需要mask
         )
         
         # 特征融合
@@ -271,11 +282,12 @@ if __name__ == "__main__":
     )
     
     # 模拟输入
-    B, N_rgb, N_hsi, N_text = 4, 196, 64, 50
+    B, N_rgb, N_hsi, N_text = 4, 197, 65, 50
     rgb_features = torch.randn(B, N_rgb, 768)
     hsi_features = torch.randn(B, N_hsi, 768)
     text_features = torch.randn(B, N_text, 768)
-    text_mask = torch.ones(B, 1, 1, N_text)
+    text_mask = torch.ones(B, N_text)  # [B, N_text]
+    text_mask[:, 40:] = 0  # 模拟padding
     
     # 前向传播
     outputs = alignment(rgb_features, hsi_features, text_features, text_mask)
@@ -284,3 +296,4 @@ if __name__ == "__main__":
     print(f"HSI对齐特征: {outputs['hsi_aligned'].shape}")
     print(f"文本对齐特征: {outputs['text_aligned'].shape}")
     print(f"对齐损失: {outputs['alignment_loss'].item():.4f}")
+    print("✓ 测试通过！")

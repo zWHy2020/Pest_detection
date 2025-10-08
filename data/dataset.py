@@ -5,6 +5,7 @@
 """
 
 import torch
+from typing import Optional
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from PIL import Image
