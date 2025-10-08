@@ -1,7 +1,6 @@
 # training/trainer.py
 """
-训练器类 - 完整版
-封装完整的训练、验证和测试流程
+训练器类 - 修复 DDP 属性访问问题
 """
 
 import torch
@@ -9,6 +8,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 from torch.cuda.amp import autocast, GradScaler
+from torch.nn.parallel import DistributedDataParallel as DDP
 from typing import Dict, Optional
 from tqdm import tqdm
 import os
@@ -21,9 +21,10 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.metrics import AverageMeter, calculate_metrics, MetricsTracker
 from utils.visualization import plot_training_curves
 
+
 class Trainer:
     """
-    通用训练器类
+    通用训练器类 - 修复版
     支持混合精度训练、梯度累积、学习率调度等
     """
     def __init__(
@@ -49,6 +50,9 @@ class Trainer:
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.device = device
+        
+        # 🔧 修复：保存一个获取原始模型的辅助方法
+        self._is_ddp = isinstance(model, DDP)
         
         # 输出配置
         self.output_dir = os.path.join(output_dir, exp_name)
@@ -77,6 +81,15 @@ class Trainer:
         self.best_val_loss = float('inf')
         self.epochs_without_improvement = 0
         self.global_step = 0
+    
+    def get_model(self):
+        """
+        🔧 修复：获取原始模型的辅助方法
+        处理 DDP 包装的情况
+        """
+        if self._is_ddp or isinstance(self.model, DDP):
+            return self.model.module
+        return self.model
     
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """训练一个epoch"""
@@ -206,12 +219,15 @@ class Trainer:
             
             pbar.set_postfix({'loss': f'{losses.avg:.4f}'})
         
+        # 🔧 修复：使用 get_model() 方法获取 num_classes
+        original_model = self.get_model()
+        
         # 计算指标
         metrics = calculate_metrics(
             np.array(all_labels),
             np.array(all_preds),
             np.array(all_probs),
-            num_classes=self.model.num_classes
+            num_classes=original_model.num_classes
         )
         
         # 记录到TensorBoard
@@ -229,9 +245,12 @@ class Trainer:
     
     def save_checkpoint(self, epoch: int, metrics: Dict, is_best: bool = False):
         """保存检查点"""
+        # 🔧 修复：保存时使用原始模型的 state_dict
+        original_model = self.get_model()
+        
         checkpoint = {
             'epoch': epoch,
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': original_model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
             'metrics': metrics,
@@ -263,7 +282,11 @@ class Trainer:
         # 恢复训练
         if resume_from:
             checkpoint = torch.load(resume_from)
-            self.model.load_state_dict(checkpoint['model_state_dict'])
+            
+            # 🔧 修复：加载到原始模型
+            original_model = self.get_model()
+            original_model.load_state_dict(checkpoint['model_state_dict'])
+            
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             if self.scheduler and checkpoint['scheduler_state_dict']:
                 self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])

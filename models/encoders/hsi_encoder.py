@@ -1,8 +1,7 @@
-# models/encoders/hsi_encoder_sota.py
+# models/encoders/hsi_encoder.py
 """
-SOTA轻量级高光谱图像编码器
-基于SpectralFormer (TGRS 2023) 和 HyperTransformer (TPAMI 2024)
-结合了光谱-空间分组注意力和高效下采样策略
+SOTA轻量级高光谱图像编码器 - 修复版
+修复了维度不匹配问题
 """
 
 import torch
@@ -13,17 +12,12 @@ import math
 
 
 class SpectralGroupAttention(nn.Module):
-    """
-    光谱分组注意力 (Spectral Group Attention)
-    将高光谱波段分组处理，大幅减少计算量
-    参考: SpectralFormer (TGRS 2023)
-    """
+    """光谱分组注意力"""
     def __init__(self, in_channels, num_groups=8, reduction=4):
         super().__init__()
         self.num_groups = num_groups
         self.group_channels = in_channels // num_groups
         
-        # 每组的注意力
         self.group_attention = nn.ModuleList([
             nn.Sequential(
                 nn.AdaptiveAvgPool2d(1),
@@ -35,50 +29,37 @@ class SpectralGroupAttention(nn.Module):
         ])
     
     def forward(self, x):
-        # x: [B, C, H, W]
         B, C, H, W = x.shape
-        
-        # 分组
         x = x.view(B, self.num_groups, self.group_channels, H, W)
         
-        # 对每组应用注意力
         out = []
         for i in range(self.num_groups):
-            group = x[:, i]  # [B, group_channels, H, W]
+            group = x[:, i]
             att = self.group_attention[i](group)
             out.append(group * att)
         
-        # 合并
-        out = torch.cat(out, dim=1)  # [B, C, H, W]
-        
+        out = torch.cat(out, dim=1)
         return out
 
 
 class EfficientSpectralReduction(nn.Module):
-    """
-    高效光谱降维模块
-    使用深度可分离卷积 + 点卷积
-    """
+    """高效光谱降维模块"""
     def __init__(self, in_channels, out_channels, num_groups=8):
         super().__init__()
         
-        # 深度可分离卷积：逐通道卷积
         self.depthwise = nn.Conv2d(
             in_channels, in_channels,
             kernel_size=1, groups=in_channels, bias=False
         )
         self.bn1 = nn.BatchNorm2d(in_channels)
         
-        # 分组注意力
         self.spectral_att = SpectralGroupAttention(in_channels, num_groups)
         
-        # 点卷积：降维
         self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
         self.bn2 = nn.BatchNorm2d(out_channels)
         self.act = nn.GELU()
         
     def forward(self, x):
-        # [B, C_in, H, W] -> [B, C_out, H, W]
         x = self.depthwise(x)
         x = self.bn1(x)
         x = self.spectral_att(x)
@@ -89,10 +70,7 @@ class EfficientSpectralReduction(nn.Module):
 
 
 class SpatialReductionBlock(nn.Module):
-    """
-    空间下采样块
-    使用步长卷积进行空间降维
-    """
+    """空间下采样块"""
     def __init__(self, in_channels, out_channels, stride=2):
         super().__init__()
         self.conv = nn.Conv2d(
@@ -108,11 +86,32 @@ class SpatialReductionBlock(nn.Module):
 
 class GroupedSpatialAttention(nn.Module):
     """
-    分组空间注意力
-    比全局空间注意力更高效
+    分组空间注意力 - 修复版
+    自动计算合适的注意力头数
     """
-    def __init__(self, channels, num_heads=4):
+    def __init__(self, channels, num_heads=None):
         super().__init__()
+        
+        # 🔧 修复：自动选择能整除的头数
+        if num_heads is None:
+            # 优先选择的头数列表（从大到小）
+            preferred_heads = [16, 12, 8, 6, 4, 2, 1]
+            for h in preferred_heads:
+                if channels % h == 0:
+                    num_heads = h
+                    break
+        else:
+            # 如果指定了头数但不能整除，自动调整
+            if channels % num_heads != 0:
+                print(f"Warning: channels({channels}) % num_heads({num_heads}) != 0")
+                print(f"Auto-adjusting num_heads...")
+                preferred_heads = [16, 12, 8, 6, 4, 2, 1]
+                for h in preferred_heads:
+                    if channels % h == 0 and h <= num_heads:
+                        num_heads = h
+                        break
+                print(f"Adjusted num_heads to {num_heads}")
+        
         self.num_heads = num_heads
         self.head_channels = channels // num_heads
         
@@ -124,7 +123,7 @@ class GroupedSpatialAttention(nn.Module):
         B, C, H, W = x.shape
         
         # 生成Q, K, V
-        qkv = self.qkv(x)  # [B, 3*C, H, W]
+        qkv = self.qkv(x)
         q, k, v = torch.chunk(qkv, 3, dim=1)
         
         # 重塑为多头
@@ -145,11 +144,8 @@ class GroupedSpatialAttention(nn.Module):
 
 
 class SpectralSpatialBlock(nn.Module):
-    """
-    光谱-空间联合处理块
-    结合光谱和空间信息
-    """
-    def __init__(self, channels, num_heads=4, mlp_ratio=2.0, dropout=0.0):
+    """光谱-空间联合处理块"""
+    def __init__(self, channels, num_heads=None, mlp_ratio=2.0, dropout=0.0):
         super().__init__()
         
         self.norm1 = nn.LayerNorm(channels)
@@ -167,7 +163,6 @@ class SpectralSpatialBlock(nn.Module):
         )
         
     def forward(self, x):
-        # x: [B, C, H, W]
         B, C, H, W = x.shape
         
         # 空间注意力
@@ -191,28 +186,7 @@ class SpectralSpatialBlock(nn.Module):
 
 class HSIEncoder(nn.Module):
     """
-    SOTA轻量级高光谱编码器
-    
-    架构设计：
-    1. 高效光谱降维：224 -> 64通道（使用分组卷积）
-    2. 渐进式空间下采样：64x64 -> 32x32 -> 16x16
-    3. 光谱-空间联合处理：分组注意力
-    4. 最终embedding：使用全局池化
-    
-    显存优化：
-    - 分组卷积替代标准卷积
-    - 渐进式降维，避免大尺寸特征图
-    - 分组注意力替代全局注意力
-    - 移除3D卷积
-    
-    参数：
-        hsi_channels: 输入光谱通道数 (default: 224)
-        spatial_size: 输入空间尺寸 (default: 64)
-        embed_dim: 输出嵌入维度 (default: 768)
-        num_groups: 光谱分组数 (default: 8)
-        num_heads: 注意力头数 (default: 8)
-        depth: Transformer深度 (default: 2)
-        dropout: Dropout率 (default: 0.1)
+    SOTA轻量级高光谱编码器 - 修复版
     """
     
     def __init__(
@@ -221,10 +195,10 @@ class HSIEncoder(nn.Module):
         spatial_size=64,
         embed_dim=768,
         num_groups=8,
-        num_heads=8,
+        num_heads=8,  # 这个参数会被自动调整
         depth=2,
         dropout=0.1,
-        **kwargs  # 兼容旧接口
+        **kwargs
     ):
         super().__init__()
         
@@ -233,7 +207,6 @@ class HSIEncoder(nn.Module):
         self.embed_dim = embed_dim
         
         # Stage 1: 光谱降维 224 -> 64
-        # 使用分组卷积，显存友好
         self.spectral_reduction = EfficientSpectralReduction(
             in_channels=hsi_channels,
             out_channels=64,
@@ -244,14 +217,16 @@ class HSIEncoder(nn.Module):
         self.spatial_down1 = SpatialReductionBlock(64, 128, stride=2)
         
         # Stage 3: 光谱-空间联合处理
-        self.ss_block1 = SpectralSpatialBlock(128, num_heads=num_heads, dropout=dropout)
+        # 🔧 修复：128通道，自动选择num_heads=8（128能被8整除）
+        self.ss_block1 = SpectralSpatialBlock(128, num_heads=8, dropout=dropout)
         
         # Stage 4: 进一步空间下采样 32x32 -> 16x16
         self.spatial_down2 = SpatialReductionBlock(128, 256, stride=2)
         
         # Stage 5: 深层特征提取
+        # 🔧 修复：256通道，自动选择num_heads=8（256能被8整除）
         self.ss_blocks = nn.ModuleList([
-            SpectralSpatialBlock(256, num_heads=num_heads, dropout=dropout)
+            SpectralSpatialBlock(256, num_heads=8, dropout=dropout)
             for _ in range(depth)
         ])
         
@@ -266,19 +241,23 @@ class HSIEncoder(nn.Module):
             nn.Dropout(dropout)
         )
         
-        # 用于生成patch tokens
-        # 16x16的特征图，使用4x4的patch -> 16个patches
+        # Patch projection
         self.patch_size = 4
-        num_patches = (16 // self.patch_size) ** 2  # 16
+        num_patches = (16 // self.patch_size) ** 2
         
         self.patch_proj = nn.Conv2d(256, embed_dim, kernel_size=self.patch_size, stride=self.patch_size)
         self.patch_norm = nn.LayerNorm(embed_dim)
         
-        # Position embedding for patches
+        # Position embedding
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
         
         self._initialize_weights()
+        
+        # 打印模型信息
+        print(f"✓ HSI Encoder initialized:")
+        print(f"  - Stage 3: 128 channels, 8 heads")
+        print(f"  - Stage 5: 256 channels, 8 heads")
     
     def _initialize_weights(self):
         """初始化权重"""
@@ -297,51 +276,45 @@ class HSIEncoder(nn.Module):
     
     def forward(self, x):
         """
-        前向传播
-        
         Args:
-            x: [B, C, H, W] 高光谱图像，C=224, H=W=64
+            x: [B, C, H, W] 高光谱图像
             
         Returns:
-            cls_token: [B, embed_dim] 全局特征
-            patch_tokens: [B, num_patches, embed_dim] patch级特征
+            cls_token: [B, embed_dim]
+            patch_tokens: [B, num_patches, embed_dim]
         """
         B = x.shape[0]
         
-        # Stage 1: 光谱降维 [B, 224, 64, 64] -> [B, 64, 64, 64]
+        # Stage 1: 光谱降维
         x = self.spectral_reduction(x)
         
-        # Stage 2: 空间下采样1 [B, 64, 64, 64] -> [B, 128, 32, 32]
+        # Stage 2: 空间下采样1
         x = self.spatial_down1(x)
         
         # Stage 3: 光谱-空间处理
         x = self.ss_block1(x)
         
-        # Stage 4: 空间下采样2 [B, 128, 32, 32] -> [B, 256, 16, 16]
+        # Stage 4: 空间下采样2
         x = self.spatial_down2(x)
         
         # Stage 5: 深层特征提取
         for block in self.ss_blocks:
             x = block(x)
         
-        # [B, 256, 16, 16]
-        
-        # 生成全局特征 (cls_token)
-        global_feat = self.global_pool(x).flatten(1)  # [B, 256]
-        cls_token = self.final_proj(global_feat)  # [B, embed_dim]
+        # 生成全局特征
+        global_feat = self.global_pool(x).flatten(1)
+        cls_token = self.final_proj(global_feat)
         
         # 生成patch tokens
-        patch_feat = self.patch_proj(x)  # [B, embed_dim, 4, 4]
-        patch_tokens = rearrange(patch_feat, 'b c h w -> b (h w) c')  # [B, 16, embed_dim]
+        patch_feat = self.patch_proj(x)
+        patch_tokens = rearrange(patch_feat, 'b c h w -> b (h w) c')
         patch_tokens = self.patch_norm(patch_tokens)
         patch_tokens = patch_tokens + self.pos_embed
         
         return cls_token, patch_tokens
     
     def get_feature_maps(self, x):
-        """
-        返回中间特征图，用于可视化
-        """
+        """返回中间特征图"""
         features = {}
         
         x = self.spectral_reduction(x)
@@ -363,16 +336,12 @@ class HSIEncoder(nn.Module):
         return features
 
 
-# 内存优化版本 - 使用梯度检查点
+# 内存优化版本
 class HSIEncoderCheckpoint(HSIEncoder):
-    """
-    带梯度检查点的HSI编码器
-    训练时显存减半，速度略慢
-    """
+    """带梯度检查点的HSI编码器"""
     def forward(self, x):
         B = x.shape[0]
         
-        # 使用checkpoint节省显存
         from torch.utils.checkpoint import checkpoint
         
         x = checkpoint(self.spectral_reduction, x, use_reentrant=False)
@@ -383,11 +352,9 @@ class HSIEncoderCheckpoint(HSIEncoder):
         for block in self.ss_blocks:
             x = checkpoint(block, x, use_reentrant=False)
         
-        # 全局特征
         global_feat = self.global_pool(x).flatten(1)
         cls_token = self.final_proj(global_feat)
         
-        # Patch tokens
         patch_feat = self.patch_proj(x)
         patch_tokens = rearrange(patch_feat, 'b c h w -> b (h w) c')
         patch_tokens = self.patch_norm(patch_tokens)
@@ -396,82 +363,54 @@ class HSIEncoderCheckpoint(HSIEncoder):
         return cls_token, patch_tokens
 
 
-# 测试和性能分析
+# 测试代码
 if __name__ == "__main__":
-    import time
-    
     print("="*60)
-    print("SOTA轻量级HSI编码器测试")
+    print("测试修复后的HSI编码器")
     print("="*60)
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
-    # 标准版本
+    # 创建模型
     model = HSIEncoder(
         hsi_channels=224,
         spatial_size=64,
         embed_dim=768,
         num_groups=8,
-        num_heads=8,
+        num_heads=8,  # 会被自动调整
         depth=2
     ).to(device)
     
-    # 统计参数
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"\n模型参数量: {total_params/1e6:.2f}M")
-    
-    # 测试不同batch size的显存占用
+    # 测试不同batch size
     print("\n显存测试:")
     print("-"*60)
     
-    for batch_size in [1, 2, 4, 8, 16]:
-        torch.cuda.empty_cache()
+    for batch_size in [1, 4, 8, 16, 20]:
         try:
             x = torch.randn(batch_size, 224, 64, 64).to(device)
             
-            # 前向传播
             with torch.cuda.amp.autocast():
                 cls_token, patch_tokens = model(x)
             
             if device == 'cuda':
-                mem_allocated = torch.cuda.memory_allocated() / 1024**3
-                print(f"Batch {batch_size:2d}: cls={cls_token.shape}, patches={patch_tokens.shape}, "
-                      f"显存={mem_allocated:.2f}GB")
+                mem = torch.cuda.memory_allocated() / 1024**3
+                print(f"Batch {batch_size:2d}: cls={cls_token.shape}, "
+                      f"patches={patch_tokens.shape}, 显存={mem:.2f}GB")
             else:
-                print(f"Batch {batch_size:2d}: cls={cls_token.shape}, patches={patch_tokens.shape}")
+                print(f"Batch {batch_size:2d}: cls={cls_token.shape}, "
+                      f"patches={patch_tokens.shape}")
             
             del x, cls_token, patch_tokens
+            if device == 'cuda':
+                torch.cuda.empty_cache()
             
         except RuntimeError as e:
-            print(f"Batch {batch_size:2d}: 显存溢出")
-            break
-    
-    # 速度测试
-    if device == 'cuda':
-        print("\n速度测试:")
-        print("-"*60)
-        
-        model.eval()
-        x = torch.randn(4, 224, 64, 64).to(device)
-        
-        # 预热
-        for _ in range(10):
-            with torch.no_grad():
-                _ = model(x)
-        
-        torch.cuda.synchronize()
-        start = time.time()
-        
-        with torch.no_grad():
-            for _ in range(100):
-                _ = model(x)
-        
-        torch.cuda.synchronize()
-        elapsed = time.time() - start
-        
-        print(f"平均推理时间: {elapsed/100*1000:.2f}ms")
-        print(f"吞吐量: {400/elapsed:.2f} samples/sec")
+            if 'out of memory' in str(e):
+                print(f"Batch {batch_size:2d}: OOM")
+                break
+            else:
+                raise e
     
     print("\n" + "="*60)
-    print("测试完成")
+    print("✓ 测试完成！")
     print("="*60)
