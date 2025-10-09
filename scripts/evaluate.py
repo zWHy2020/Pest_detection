@@ -16,7 +16,11 @@ import numpy as np
 import json
 import warnings
 warnings.filterwarnings('ignore')
+# ... (import 语句之后) ...
 
+
+
+# ... (脚本的其余部分) ...
 # 添加项目根目录
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
@@ -27,6 +31,9 @@ from data import create_dataloaders
 from utils import (calculate_metrics, calculate_per_class_metrics, 
                    topk_accuracy, plot_confusion_matrix, 
                    plot_per_class_metrics, plot_feature_distribution)
+
+
+
 
 
 class Evaluator:
@@ -186,12 +193,15 @@ class Evaluator:
             text_mask = batch['text_attention_mask'].to(self.device, non_blocking=True)
             labels = batch['labels'].to(self.device, non_blocking=True)
             
+            
+
             # 前向传播
             outputs = self.model(
                 rgb, hsi, text_ids, text_mask,
                 labels=None,
                 return_features=self.args.extract_features
             )
+            
             
             logits = outputs['logits']
             probs = F.softmax(logits, dim=1)

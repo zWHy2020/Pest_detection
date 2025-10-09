@@ -2,7 +2,7 @@
 """
 完整的多模态病虫害识别模型 - 修复版
 """
-
+from training.loss import FocalLoss
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -56,7 +56,7 @@ class MultiModalPestDetection(nn.Module):
         freeze_encoders: bool = False
     ):
         super().__init__()
-        
+        self.cls_criterion = FocalLoss()
         self.num_classes = num_classes
         self.use_llm = llm_model_name is not None
         
@@ -220,16 +220,19 @@ class MultiModalPestDetection(nn.Module):
         cls_loss = None
         
         if labels is not None:
-            cls_loss = F.cross_entropy(logits, labels)
-            total_loss = cls_loss + 0.1 * alignment_loss
+            cls_loss = self.cls_criterion(logits, labels)
+            alignment_loss = alignment_outputs['alignment_loss']
+            alignment_weight = 1.0
+            total_loss = cls_loss + alignment_weight * alignment_loss
         
         # ============ 返回结果 ============
+        device = logits.device
         outputs = {
             'logits': logits,
             'fused_features': fused_features,
             'alignment_loss': alignment_loss,
-            'cls_loss': cls_loss if cls_loss is not None else torch.tensor(0.0),
-            'total_loss': total_loss if total_loss is not None else torch.tensor(0.0)
+            'cls_loss': cls_loss if cls_loss is not None else torch.tensor(0.0, device=device),
+            'total_loss': total_loss if total_loss is not None else torch.tensor(0.0, device=device)
         }
         
         if return_features:
