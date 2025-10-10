@@ -12,7 +12,6 @@ from typing import Optional, Dict, Tuple
 
 class MultiModalEmbeddingAdapter(nn.Module):
     """
-    多模态到 LLM Embedding 的适配器
     使用 Q-Former 风格的架构进行特征压缩和对齐
     """
     def __init__(

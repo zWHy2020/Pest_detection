@@ -17,3 +17,5 @@
 /diagnose_training_issue.py
 /scripts/train_with_class_weights.py
 /scripts/train_ddp_optimized.py
+/inference_test_set
+/eval_results
