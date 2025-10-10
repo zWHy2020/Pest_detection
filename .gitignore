@@ -1,6 +1,6 @@
 /data/processed_data
 /data/raw_data
-/evaluation_results
+/evaluation_results/*npz
 /models/bert-base-chinese
 /models/qwen2.5-7b
 /outputs
@@ -18,4 +18,5 @@
 /scripts/train_with_class_weights.py
 /scripts/train_ddp_optimized.py
 /inference_test_set
-/eval_results
+/eval_results/qwen_balanced/*npy
+/evaluation_results/*npy
