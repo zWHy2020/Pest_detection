@@ -144,10 +144,11 @@ class CrossModalAlignmentModule(nn.Module):
         embed_dim: int = 768,
         num_heads: int = 8,
         dropout: float = 0.1,
-        temperature: float = 0.07
+        temperature: float = 0.07,
+        use_hsi: bool = True
     ):
         super().__init__()
-        
+        self.use_hsi = use_hsi
         # 跨模态注意力层
         # RGB -> Text
         self.rgb_to_text_attn = CrossModalAttention(
@@ -261,8 +262,13 @@ class CrossModalAlignmentModule(nn.Module):
         loss_hsi_text = self.contrastive(hsi_pooled, text_pooled)
         loss_rgb_hsi = self.contrastive(rgb_pooled, hsi_pooled)
         
-        alignment_loss = (loss_rgb_text + loss_hsi_text + loss_rgb_hsi) / 3
-        
+        if self.use_hsi:
+            loss_hsi_text = self.contrastive(hsi_pooled, text_pooled)
+            loss_rgb_hsi = self.contrastive(rgb_pooled, hsi_pooled)
+            alignment_loss = (loss_rgb_text + loss_hsi_text + loss_rgb_hsi) / 3
+        else:
+            alignment_loss = loss_rgb_text
+
         return {
             'rgb_aligned': rgb_aligned,
             'hsi_aligned': hsi_aligned,

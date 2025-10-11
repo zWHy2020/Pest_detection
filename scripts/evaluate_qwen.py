@@ -62,7 +62,8 @@ class QwenEvaluator:
             batch_size=self.args.batch_size,
             num_workers=self.args.num_workers,
             text_model_name='bert-base-chinese',
-            use_augmentation=False
+            use_augmentation=False,
+            use_hsi=self.args.use_hsi
         )
         
         self.num_classes = self.test_loader.dataset.num_classes
@@ -78,7 +79,8 @@ class QwenEvaluator:
         self.model = MultiModalPestDetectionWithQwen(
             num_classes=self.num_classes,
             qwen_path=self.args.qwen_path,
-            use_lora=True
+            use_lora=True,
+            use_hsi=self.args.use_hsi
         )
         
         # 加载权重
@@ -236,7 +238,8 @@ def parse_args():
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--output_dir', type=str, default='./eval_results')
-    
+    parser.add_argument('--use_hsi', action=argparse.BooleanOptionalAction, default=True)
+
     return parser.parse_args()
 
 

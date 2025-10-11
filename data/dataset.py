@@ -28,6 +28,7 @@ class PestDataset(Dataset):
         hsi_transform = None,
         text_model_name: str = 'bert-base-chinese',
         max_text_length: int = 128,
+        use_hsi: bool = True,
         use_augmentation: bool = True
     ):
         """
@@ -45,6 +46,7 @@ class PestDataset(Dataset):
         self.data_root = data_root
         self.split = split
         self.max_text_length = max_text_length
+        self.use_hsi = use_hsi
         
         # 加载数据索引
         self.samples = self._load_samples()
@@ -141,16 +143,16 @@ class PestDataset(Dataset):
             rgb_image = torch.from_numpy(rgb_image).permute(2, 0, 1).float() / 255.0
         
         # 加载高光谱图像
-        hsi_path = os.path.join(self.data_root, sample['hsi_path'])
-        hsi_image = np.load(hsi_path)  # 假设保存为.npy格式
+        if self.use_hsi:
+            hsi_path = os.path.join(self.data_root, sample['hsi_path'])
+            hsi_image = np.load(hsi_path)
+            hsi_image = (hsi_image - hsi_image.min()) / (hsi_image.max() - hsi_image.min() + 1e-8)
+            hsi_image = torch.from_numpy(hsi_image).float()
+            if hsi_image.dim() == 3 and hsi_image.shape[-1] > hsi_image.shape[0]:
+                hsi_image = hsi_image.permute(2,0,1)
+        else:
+            hsi_image = torch.zeros((224, 64, 64), dtype=torch.float32)
         
-        # HSI归一化
-        hsi_image = (hsi_image - hsi_image.min()) / (hsi_image.max() - hsi_image.min() + 1e-8)
-        hsi_image = torch.from_numpy(hsi_image).float()
-        
-        # 如果HSI是 [H, W, C] 格式，转换为 [C, H, W]
-        if hsi_image.dim() == 3 and hsi_image.shape[-1] > hsi_image.shape[0]:
-            hsi_image = hsi_image.permute(2, 0, 1)
         
         # 加载文本描述
         text = sample['description']
@@ -218,7 +220,8 @@ def create_dataloaders(
     batch_size: int = 16,
     num_workers: int = 4,
     text_model_name: str = 'bert-base-chinese',
-    use_augmentation: bool = True
+    use_augmentation: bool = True,
+    use_hsi: bool = True
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     创建训练、验证和测试数据加载器
@@ -238,20 +241,23 @@ def create_dataloaders(
         data_root=data_root,
         split='train',
         text_model_name=text_model_name,
-        use_augmentation=use_augmentation
+        use_augmentation=use_augmentation,
+        use_hsi=use_hsi
     )
     
     val_dataset = PestDataset(
         data_root=data_root,
         split='val',
         text_model_name=text_model_name,
-        use_augmentation=False
+        use_augmentation=False,
+        use_hsi=use_hsi
     )
     
     test_dataset = PestDataset(
         data_root=data_root,
         split='test',
         text_model_name=text_model_name,
+        use_hsi=use_hsi,
         use_augmentation=False
     )
     

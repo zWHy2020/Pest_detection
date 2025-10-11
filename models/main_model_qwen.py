@@ -58,13 +58,14 @@ class MultiModalPestDetectionWithQwen(nn.Module):
         lora_rank: int = 8,
         lora_alpha: float = 16,
         num_query_tokens: int = 32,
+        use_hsi: bool = True,
         
         # 微调策略
         freeze_encoders: bool = False,
         trainable_layers: List[str] = ['embedding', 'lm_head'],  # Qwen 中可训练的层
     ):
         super().__init__()
-        
+        self.use_hsi = use_hsi
         self.num_classes = num_classes
         self.qwen_path = qwen_path
         
@@ -110,6 +111,7 @@ class MultiModalPestDetectionWithQwen(nn.Module):
         self.alignment = CrossModalAlignmentModule(
             rgb_dim=embed_dim,
             hsi_dim=embed_dim,
+            use_hsi=self.use_hsi,
             text_dim=embed_dim,
             embed_dim=embed_dim,
             num_heads=num_heads,
@@ -270,9 +272,11 @@ class MultiModalPestDetectionWithQwen(nn.Module):
         # ============ 1. 特征编码 ============
         rgb_cls, rgb_patches = self.rgb_encoder(rgb_images)
         rgb_features = torch.cat([rgb_cls.unsqueeze(1), rgb_patches], dim=1)
-        
-        hsi_cls, hsi_patches = self.hsi_encoder(hsi_images)
-        hsi_features = torch.cat([hsi_cls.unsqueeze(1), hsi_patches], dim=1)
+        if self.use_hsi:
+            hsi_cls, hsi_patches = self.hsi_encoder(hsi_images)
+            hsi_features = torch.cat([hsi_cls.unsqueeze(1), hsi_patches], dim=1)
+        else:
+            hsi_features = torch.zeros_like(rgb_features)
         
         text_outputs = self.text_encoder(text_input_ids, text_attention_mask)
         text_features = text_outputs['sequence_features']

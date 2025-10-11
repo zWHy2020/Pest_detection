@@ -75,6 +75,7 @@ class MemoryEfficientQwenTrainer:
             batch_size=self.args.batch_size,
             num_workers=min(self.args.num_workers, 2),  # 最多2个worker
             text_model_name='bert-base-chinese',
+            use_hsi=self.args.use_hsi,
             use_augmentation=False  # Qwen训练时不用增强
         )
         
@@ -103,13 +104,14 @@ class MemoryEfficientQwenTrainer:
             fusion_layers=4,
             fusion_strategy='hierarchical',
             qwen_path=self.args.qwen_path,
+            use_hsi=self.args.use_hsi,
+            freeze_encoders=False,
             use_lora=True,
             lora_rank=8,
             lora_alpha=16,
-            num_query_tokens=32,
-            freeze_encoders=False
+            num_query_tokens=32
         )
-        
+
         # 移到设备
         self.model = self.model.to(self.device)
         
@@ -480,6 +482,7 @@ def parse_args():
     
     # 输出
     parser.add_argument('--output_dir', type=str, default='./outputs/qwen_fixed')
+    parser.add_argument('--use_hsi', action=argparse.BooleanOptionalAction, default=True)
     
     return parser.parse_args()
 

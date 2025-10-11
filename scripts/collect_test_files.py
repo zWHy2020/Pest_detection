@@ -20,7 +20,7 @@ def main():
 
     # 创建输出文件夹
     os.makedirs(output_dir, exist_ok=True)
-    print(f"将把所有测试文件复制到: {output_dir}")
+    print(f"将把所有测试图片文件复制到: {output_dir}")
 
     copied_count = 0
     # 遍历 test.json 中的每一个样本
@@ -29,24 +29,25 @@ def main():
         rgb_relative_path = sample['rgb_path']
         rgb_source_path = os.path.join(data_root, rgb_relative_path)
 
-        # 获取原始HSI文件路径 (如果有的话)
-        hsi_relative_path = sample['hsi_path']
-        hsi_source_path = os.path.join(data_root, hsi_relative_path)
+        # ### --- 修改点 1：不再需要处理HSI路径 --- ###
+        # # 获取原始HSI文件路径 (如果有的话)
+        # hsi_relative_path = sample['hsi_path']
+        # hsi_source_path = os.path.join(data_root, hsi_relative_path)
         
-        # 定义目标路径
+        # 定义目标路径 (只定义RGB的)
         rgb_dest_path = os.path.join(output_dir, os.path.basename(rgb_source_path))
-        hsi_dest_path = os.path.join(output_dir, os.path.basename(hsi_source_path))
 
         # 复制RGB文件
         if os.path.exists(rgb_source_path):
             shutil.copy(rgb_source_path, rgb_dest_path)
             copied_count += 1
         
-        # 复制HSI文件
-        if os.path.exists(hsi_source_path):
-            shutil.copy(hsi_source_path, hsi_dest_path)
+        # ### --- 修改点 2：删除复制HSI文件的代码 --- ###
+        # # 复制HSI文件
+        # if os.path.exists(hsi_source_path):
+        #     shutil.copy(hsi_source_path, hsi_dest_path)
 
-    print(f"\n复制完成！共复制了 {copied_count} 个RGB文件及其对应的HSI文件。")
+    print(f"\n复制完成！共复制了 {copied_count} 个RGB图片文件。")
     print(f"现在您可以使用下面的指令对 '{output_dir}' 文件夹进行批量推理。")
 
 if __name__ == '__main__':
