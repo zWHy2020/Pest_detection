@@ -19,6 +19,8 @@ diagnose_training_issue.py
 no_hsi_inference_fixed.json
 no_hsi_inference.json
 training_config.json
-
+final_inference_results.json
+eval_results/qwen_corrected_v1
+data/newiest_processed_data
 
 

@@ -1,7 +1,7 @@
 # data/dataset.py
 """
-多模态病虫害数据集
-支持RGB图像、高光谱图像和文本描述的加载
+多模态病虫害数据集 - 修改版
+增加了文本遮蔽功能，强制模型学习图像特征
 """
 
 import torch
@@ -15,6 +15,7 @@ from typing import Dict, List, Tuple, Optional
 from transformers import AutoTokenizer
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
+import random
 
 class PestDataset(Dataset):
     """
@@ -29,17 +30,15 @@ class PestDataset(Dataset):
         text_model_name: str = 'bert-base-chinese',
         max_text_length: int = 128,
         use_hsi: bool = True,
-        use_augmentation: bool = True
+        use_augmentation: bool = True,
+        use_text_dropout: bool = True, # 新增参数，用于控制是否启用文本遮蔽
+        text_dropout_ratio: float = 0.2 # 新增参数，设置文本遮蔽的概率
     ):
         """
         Args:
-            data_root: 数据集根目录
-            split: 'train', 'val', 或 'test'
-            rgb_transform: RGB图像变换
-            hsi_transform: 高光谱图像变换
-            text_model_name: 文本编码器模型名称
-            max_text_length: 最大文本长度
-            use_augmentation: 是否使用数据增强
+            (...)
+            use_text_dropout: 是否在训练时启用文本遮蔽
+            text_dropout_ratio: 文本遮蔽的概率
         """
         super().__init__()
         
@@ -47,6 +46,8 @@ class PestDataset(Dataset):
         self.split = split
         self.max_text_length = max_text_length
         self.use_hsi = use_hsi
+        self.use_text_dropout = use_text_dropout
+        self.text_dropout_ratio = text_dropout_ratio
         
         # 加载数据索引
         self.samples = self._load_samples()
@@ -116,9 +117,7 @@ class PestDataset(Dataset):
     
     def _get_default_hsi_transform(self, use_augmentation: bool):
         """获取默认的高光谱图像变换"""
-        # 高光谱图像的数据增强需要更谨慎
-        # 因为光谱信息对物理意义敏感
-        return None  # 暂时返回None，后续可以添加特定的HSI增强
+        return None 
     
     def __len__(self) -> int:
         return len(self.samples)
@@ -126,9 +125,6 @@ class PestDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
         获取一个样本
-        
-        Returns:
-            包含rgb_image, hsi_image, text, label的字典
         """
         sample = self.samples[idx]
         
@@ -151,11 +147,15 @@ class PestDataset(Dataset):
             if hsi_image.dim() == 3 and hsi_image.shape[-1] > hsi_image.shape[0]:
                 hsi_image = hsi_image.permute(2,0,1)
         else:
-            hsi_image = torch.zeros((224, 64, 64), dtype=torch.float32)
+            hsi_image = torch.zeros((1, 224, 64, 64), dtype=torch.float32)[0] # 保持维度一致
         
         
         # 加载文本描述
         text = sample['description']
+
+        # --- 核心修改：实现文本遮蔽 ---
+        if self.split == 'train' and self.use_text_dropout and random.random() < self.text_dropout_ratio:
+            text = "一张需要分析的植物叶片图片。"
         
         # Tokenize文本
         text_encoded = self.tokenizer(
@@ -182,27 +182,14 @@ class PestDataset(Dataset):
 
 def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     """
-    自定义collate函数，处理不同大小的HSI图像
+    自定义collate函数
     """
-    # 收集所有字段
     rgb_images = torch.stack([item['rgb_image'] for item in batch])
     text_input_ids = torch.stack([item['text_input_ids'] for item in batch])
     text_attention_mask = torch.stack([item['text_attention_mask'] for item in batch])
     labels = torch.stack([item['label'] for item in batch])
     
-    # HSI图像可能需要特殊处理
-    hsi_images = []
-    for item in batch:
-        hsi = item['hsi_image']
-        hsi_images.append(hsi)
-    
-    # 如果所有HSI图像大小相同，可以stack
-    try:
-        hsi_images = torch.stack(hsi_images)
-    except:
-        # 否则需要padding或resize到统一大小
-        # 这里简单起见，假设已经是统一大小
-        pass
+    hsi_images = torch.stack([item['hsi_image'] for item in batch])
     
     return {
         'rgb_images': rgb_images,
@@ -224,25 +211,16 @@ def create_dataloaders(
     use_hsi: bool = True
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
-    创建训练、验证和测试数据加载器
-    
-    Args:
-        data_root: 数据集根目录
-        batch_size: 批次大小
-        num_workers: 工作进程数
-        text_model_name: 文本模型名称
-        use_augmentation: 是否使用数据增强
-        
-    Returns:
-        train_loader, val_loader, test_loader
+    创建数据加载器
     """
-    # 创建数据集
     train_dataset = PestDataset(
         data_root=data_root,
         split='train',
         text_model_name=text_model_name,
         use_augmentation=use_augmentation,
-        use_hsi=use_hsi
+        use_hsi=use_hsi,
+        use_text_dropout=True, # 确保开启
+        text_dropout_ratio=0.2 # 20%的概率遮蔽文本
     )
     
     val_dataset = PestDataset(
@@ -250,7 +228,8 @@ def create_dataloaders(
         split='val',
         text_model_name=text_model_name,
         use_augmentation=False,
-        use_hsi=use_hsi
+        use_hsi=use_hsi,
+        use_text_dropout=False # 验证集不使用
     )
     
     test_dataset = PestDataset(
@@ -258,10 +237,10 @@ def create_dataloaders(
         split='test',
         text_model_name=text_model_name,
         use_hsi=use_hsi,
-        use_augmentation=False
+        use_augmentation=False,
+        use_text_dropout=False # 测试集不使用
     )
     
-    # 创建数据加载器
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -291,141 +270,3 @@ def create_dataloaders(
     )
     
     return train_loader, val_loader, test_loader
-
-
-# 数据集准备工具
-class DatasetBuilder:
-    """
-    辅助工具：从原始数据构建标准格式的数据集
-    """
-    @staticmethod
-    def build_from_folders(
-        rgb_folder: str,
-        hsi_folder: str,
-        text_file: str,
-        output_folder: str,
-        train_ratio: float = 0.7,
-        val_ratio: float = 0.15,
-        test_ratio: float = 0.15
-    ):
-        """
-        从文件夹构建数据集
-        
-        数据组织格式：
-        rgb_folder/
-            class1/
-                img1.jpg
-                img2.jpg
-            class2/
-                ...
-        hsi_folder/
-            class1/
-                img1.npy
-                img2.npy
-            class2/
-                ...
-        text_file: JSON文件，格式为 {filename: description}
-        """
-        import shutil
-        from sklearn.model_selection import train_test_split
-        
-        os.makedirs(output_folder, exist_ok=True)
-        
-        # 加载文本描述
-        with open(text_file, 'r', encoding='utf-8') as f:
-            text_descriptions = json.load(f)
-        
-        # 收集所有样本
-        samples = []
-        class_names = sorted(os.listdir(rgb_folder))
-        class_to_idx = {name: idx for idx, name in enumerate(class_names)}
-        
-        for class_name in class_names:
-            rgb_class_folder = os.path.join(rgb_folder, class_name)
-            hsi_class_folder = os.path.join(hsi_folder, class_name)
-            
-            rgb_files = sorted(os.listdir(rgb_class_folder))
-            
-            for rgb_file in rgb_files:
-                # 获取对应的HSI文件
-                base_name = os.path.splitext(rgb_file)[0]
-                hsi_file = base_name + '.npy'
-                
-                # 检查文件是否存在
-                rgb_path = os.path.join(rgb_class_folder, rgb_file)
-                hsi_path = os.path.join(hsi_class_folder, hsi_file)
-                
-                if not os.path.exists(hsi_path):
-                    print(f"警告: HSI文件不存在 {hsi_path}")
-                    continue
-                
-                # 获取文本描述
-                description = text_descriptions.get(
-                    base_name,
-                    f"{class_name}病虫害"  # 默认描述
-                )
-                
-                samples.append({
-                    'id': base_name,
-                    'rgb_path': os.path.join(class_name, rgb_file),
-                    'hsi_path': os.path.join(class_name, hsi_file),
-                    'description': description,
-                    'class': class_name
-                })
-        
-        # 划分数据集
-        train_samples, temp_samples = train_test_split(
-            samples, train_size=train_ratio, stratify=[s['class'] for s in samples],
-            random_state=42
-        )
-        
-        val_samples, test_samples = train_test_split(
-            temp_samples,
-            train_size=val_ratio/(val_ratio + test_ratio),
-            stratify=[s['class'] for s in temp_samples],
-            random_state=42
-        )
-        
-        # 保存分割信息
-        with open(os.path.join(output_folder, 'train.json'), 'w', encoding='utf-8') as f:
-            json.dump(train_samples, f, ensure_ascii=False, indent=2)
-        
-        with open(os.path.join(output_folder, 'val.json'), 'w', encoding='utf-8') as f:
-            json.dump(val_samples, f, ensure_ascii=False, indent=2)
-        
-        with open(os.path.join(output_folder, 'test.json'), 'w', encoding='utf-8') as f:
-            json.dump(test_samples, f, ensure_ascii=False, indent=2)
-        
-        # 保存类别映射
-        with open(os.path.join(output_folder, 'class_mapping.json'), 'w', encoding='utf-8') as f:
-            json.dump(class_to_idx, f, ensure_ascii=False, indent=2)
-        
-        # 复制RGB和HSI文件到输出文件夹
-        for folder_name in ['rgb', 'hsi']:
-            src_folder = rgb_folder if folder_name == 'rgb' else hsi_folder
-            dst_folder = os.path.join(output_folder, folder_name)
-            
-            if os.path.exists(dst_folder):
-                shutil.rmtree(dst_folder)
-            shutil.copytree(src_folder, dst_folder)
-        
-        print(f"数据集构建完成！")
-        print(f"训练集: {len(train_samples)} 样本")
-        print(f"验证集: {len(val_samples)} 样本")
-        print(f"测试集: {len(test_samples)} 样本")
-        print(f"类别数: {len(class_to_idx)}")
-
-
-# 测试代码
-if __name__ == "__main__":
-    # 示例：构建数据集
-    # DatasetBuilder.build_from_folders(
-    #     rgb_folder='./raw_data/rgb',
-    #     hsi_folder='./raw_data/hsi',
-    #     text_file='./raw_data/descriptions.json',
-    #     output_folder='./processed_data'
-    # )
-    
-    # 测试数据加载
-    print("数据集模块准备就绪！")
-    print("请使用 DatasetBuilder.build_from_folders() 构建数据集")

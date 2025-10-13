@@ -21,7 +21,6 @@ from albumentations.pytorch import ToTensorV2
 class QwenPredictor:
     """Qwen 模型推理器"""
     
-    ### --- 修改点 1：在初始化时接收 data_root --- ###
     def __init__(self, checkpoint_path, qwen_path, data_root, use_hsi=True, device='cuda'):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         
@@ -32,7 +31,7 @@ class QwenPredictor:
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
         
         # 加载类别映射
-        self.load_class_mapping(data_root) ### --- 修改点 2：将 data_root 传递给加载函数 --- ###
+        self.load_class_mapping(data_root)
         
         # 创建模型
         print("创建模型...")
@@ -54,12 +53,10 @@ class QwenPredictor:
         self.model = self.model.to(self.device)
         self.model.eval()
         
-        # ... (后续代码不变) ...
         self.tokenizer = AutoTokenizer.from_pretrained('bert-base-chinese', trust_remote_code=True)
         self.rgb_transform = A.Compose([A.Resize(224, 224), A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]), ToTensorV2()])
         print("✓ 模型加载完成\n")
     
-    ### --- 修改点 3：修改函数以使用 data_root --- ###
     def load_class_mapping(self, data_root):
         """加载类别映射"""
         mapping_path = os.path.join(data_root, 'class_mapping.json')
@@ -70,16 +67,12 @@ class QwenPredictor:
                 self.class_to_idx = json.load(f)
                 self.idx_to_class = {v: k for k, v in self.class_to_idx.items()}
         else:
-            # 保持错误处理逻辑
-            print(f"警告: 在 {data_root} 中找不到 class_mapping.json 文件！")
-            self.num_classes = 15 # 作为一个备用方案，您可以硬编码您的类别数
-            self.idx_to_class = {i: f'Class_{i}' for i in range(self.num_classes)}
-            return
+            print(f"错误: 在 '{data_root}' 中找不到 class_mapping.json 文件！推理无法进行。")
+            sys.exit(1)
         
         self.num_classes = len(self.idx_to_class)
         print(f"类别加载成功，共 {self.num_classes} 个类别。")
 
-    # ... (所有 predict, preprocess 等方法都保持不变) ...
     def preprocess_rgb(self, image_path):
         image = Image.open(image_path).convert('RGB')
         image = np.array(image)
@@ -98,27 +91,34 @@ class QwenPredictor:
             return torch.zeros(1, 224, 64, 64)
     
     def preprocess_text(self, text):
-        if not text: text = "病虫害检测"
+        # --- 核心修改：使用与训练中文本遮蔽时相同的通用文本 ---
+        if not text: 
+            text = "一张需要分析的植物叶片图片。"
+            
         encoded = self.tokenizer(text, padding='max_length', truncation=True, max_length=128, return_tensors='pt')
         return encoded['input_ids'], encoded['attention_mask']
     
     @torch.no_grad()
     def predict(self, rgb_path, hsi_path=None, text=None, top_k=5):
         rgb = self.preprocess_rgb(rgb_path).to(self.device)
-        hsi = self.preprocess_hsi(hsi_path).to(self.device)
+        hsi = self.preprocess_hsi(hsi_path, self.model.use_hsi).to(self.device)
         text_ids, text_mask = self.preprocess_text(text)
         text_ids, text_mask = text_ids.to(self.device), text_mask.to(self.device)
+        
         outputs = self.model(rgb, hsi, text_ids, text_mask)
         logits = outputs['logits']
         probs = F.softmax(logits, dim=1)
+        
         top_probs, top_indices = torch.topk(probs, min(top_k, self.num_classes), dim=1)
         top_probs, top_indices = top_probs.squeeze().cpu().numpy(), top_indices.squeeze().cpu().numpy()
+        
         predictions = []
-        # 修正迭代，以防top_k=1时出错
         if top_indices.ndim == 0:
             top_indices, top_probs = [top_indices], [top_probs]
+            
         for idx, prob in zip(top_indices, top_probs):
             predictions.append({'class_id': int(idx), 'class_name': self.idx_to_class.get(int(idx), f'Unknown_{idx}'), 'confidence': float(prob)})
+            
         return {'rgb_path': rgb_path, 'hsi_path': hsi_path, 'text': text, 'predictions': predictions, 'top_prediction': predictions[0]}
     
     def predict_batch(self, image_dir, output_file='predictions.json', pattern='*.jpg', text=None):
@@ -131,20 +131,23 @@ class QwenPredictor:
             if not os.path.exists(hsi_path): hsi_path = None
             result = self.predict(image_path, hsi_path, text)
             results.append(result)
+            
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
+            
         print(f"结果保存到: {output_file}")
-        # 打印部分结果以供快速查看
+        
+        print("\n前5张图片预测结果示例:")
         for res in results[:5]:
             top = res['top_prediction']
-            print(f"处理: {os.path.basename(res['rgb_path'])}, 预测: {top['class_name']} (置信度: {top['confidence']:.4f})")
+            print(f"  - 文件: {os.path.basename(res['rgb_path'])}, 预测: {top['class_name']} (置信度: {top['confidence']:.4f})")
+            
         return results
 
 def parse_args():
+    # ... (这部分代码无需修改，此处省略)
     parser = argparse.ArgumentParser(description='Qwen模型推理')
-    
     parser.add_argument('--checkpoint', type=str, required=True)
-    ### --- 修改点 4：添加 data_root 参数 --- ###
     parser.add_argument('--data_root', type=str, required=True, help='处理后的数据集根目录 (包含 class_mapping.json)')
     parser.add_argument('--qwen_path', type=str, default='./models/qwen2.5-7b')
     parser.add_argument('--device', type=str, default='cuda')
@@ -156,22 +159,12 @@ def parse_args():
     parser.add_argument('--output', type=str, default='predictions.json')
     parser.add_argument('--top_k', type=int, default=5)
     parser.add_argument('--use_hsi', action=argparse.BooleanOptionalAction, default=True)
-    
     return parser.parse_args()
 
 def main():
+    # ... (这部分代码无需修改，此处省略)
     args = parse_args()
-    
-    # 创建预测器
-    predictor = QwenPredictor(
-        checkpoint_path=args.checkpoint,
-        qwen_path=args.qwen_path,
-        data_root=args.data_root, ### --- 修改点 5：将 data_root 传递给预测器 --- ###
-        device=args.device,
-        use_hsi=args.use_hsi
-    )
-    
-    # ... (后续逻辑不变) ...
+    predictor = QwenPredictor(checkpoint_path=args.checkpoint, qwen_path=args.qwen_path, data_root=args.data_root, device=args.device, use_hsi=args.use_hsi)
     if args.rgb_image:
         print("="*60 + "\n单张图像推理\n" + "="*60)
         result = predictor.predict(rgb_path=args.rgb_image, hsi_path=args.hsi_image, text=args.text, top_k=args.top_k)
